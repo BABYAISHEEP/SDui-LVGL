@@ -1,8 +1,21 @@
-# LVGL for frame buffer device
+## 1. 项目说明
 
-LVGL configured to work with /dev/fb0 on Linux.
+​		本项目的前身是作为本人的毕业设计，如今已经结束了相关流程，因此开源了此工程。
 
-When cloning this repository, also make sure to download submodules (`git submodule update --init --recursive`) otherwise you will be missing key components.
+​		项目想发起源于各大平台都有调用stableDiffusion API的功能实现绘图，但是在嵌入式平台中却没有找到类似的项目(公开的)，由于本人对于Linux和LVGL的认知尚浅，因此想通过本项目提升技术。也因此，本项目有很多地方的代码并不高明，仅作为抛砖引玉的作用，也希望各位大佬可以迭代出更强大的版本！
 
-Check out this blog post for a step by step tutorial:
-https://blog.lvgl.io/2018-01-03/linux_fb
+​		代码逻辑解释：
+
+## 2. 工程前期准备		
+
+​		如果您阅读过百问网的相关代码，您会发现“画板”部分非常的相像：
+
+​		API方面，如今已经有v3版本的接口，但是我使用的本地SD只有v1的版本。如果您在各大提供post等测试的平台看过v3接口的具体内容，其实具体细节的变化并不大，因此可以先研究最初始的，也可以触类旁通。
+
+​		具体的v1接口示范：
+
+​		LVGL框架版本选择：本文撰写时已经有9.0.0版本，而互联网上很多文章可能还在用8.3.x甚至是7.x.x，此时并不需要惊慌，因为很多接口是通用的。当你使用一个函数，如果你的编译器会提供自动补全，而且有弹出相关的参数定义，那么您输入的函数大概率是可以使用的。
+
+​		前文提到我使用了百问网的画板接口，它并不兼容我的9.x.x版本，但是有取巧的方法：网上提供的接口为了稳定性，会在对应的头文件中加入版本控制的宏判断语句，对应的宏在框架的 有记录。因此我们只需要删除掉相关的接口判断语句即可，如果编译不通过再继续找问题。
+
+TODO ...
