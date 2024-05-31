@@ -19,7 +19,7 @@ CFLAGS += -I./user
 
 # 使用 scp 命令将文件发送到目标板子
 EXECUTABLE := demo
-TARGET_IP := 192.168.60.32
+TARGET_IP := 192.168.10.108
 TARGET_USER := cat
 TARGET_PATH := /home/cat/demo
 PASSWORD := temppwd
@@ -35,6 +35,7 @@ CSRCS +=$(LVGL_DIR)/mouse_cursor_icon.c
 #我自己的
 CSRCS += $(LVGL_DIR)/user/lv_100ask_sketchpad.c
 CSRCS += $(LVGL_DIR)/user/cJSON.c
+CSRCS += $(LVGL_DIR)/user/tip.c
 
 OBJEXT ?= .o
 
@@ -73,4 +74,7 @@ run:
 
 stop:
 	sshpass -p $(PASSWORD) ssh $(TARGET_USER)@$(TARGET_IP) "sudo killall -9 $(EXECUTABLE)"
+
+sed:
+	scp $(BIN) $(TARGET_USER)@$(TARGET_IP):$(TARGET_PATH)
 	

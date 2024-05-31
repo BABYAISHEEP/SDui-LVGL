@@ -11,17 +11,21 @@
 #include <sys/resource.h>
 #include <dirent.h>
 #include <string.h>
+#include <fcntl.h>
 
 #include <pthread.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include "user/cJSON.h"
+#include "user/tip.h"
+//---------提示词相关//---------
+
 // #include "user/curl.h"
 //  #include <png.h>
 //-------------连接服务器-------------
 #define MAX_BUFFER_SIZE 10240000
 #define SERVER_PORT 2300
-#define SERVER_IP "192.168.60.3"
+#define SERVER_IP "192.168.10.104"
 #define BASE_NAME "1.base64"
 #define SERVER_BASE_FILE_NAME "server.base"
 #define SERVER_PNG_FILE_NAME "server.png"
@@ -30,21 +34,15 @@
 
 #define BMP_PIXEL_OFFSET 138
 //-------------------JSON----------------------
-char show_txt[][18] = {"1xxxxx", "2xxxxx", "3xxxxx", "4xxxxx", "5xxxxx", "6xxxxx", "water", "beach", "street",
-                       "day",    "night",  "flower", "sfw",    "nsfw",   "one",    "two",   "girl",  "boy"};
-char nenegative_prompt[] =
-    "(worst quality:2), (low quality:2), (normal quality:2), lowres, normal quality, ((monochrome)), ((grayscale)), "
-    "skin spots, acnes, skin blemishes, age spot, (ugly:1.331), (duplicate:1.331), (morbid:1.21), (mutilated:1.21), "
-    "(tranny:1.331), mutated hands, (poorly drawn hands:1.5), blurry, (bad anatomy:1.21), (bad proportions:1.331), "
-    "extra limbs, (disfigured:1.331), (missing arms:1.331), (extra legs:1.331), (fused fingers:1.61051), (too many "
-    "fingers:1.61051), (unclear eyes:1.331), lowers, bad hands, missing fingers, extra digit,bad hands, missing "
-    "fingers, (((extra arms and legs)))";
+// char show_txt[][18] = {"1xxxxx", "2xxxxx", "3xxxxx", "4xxxxx", "5xxxxx", "6xxxxx", "water", "beach", "street",
+//                        "day",    "night",  "flower", "sfw",    "nsfw",   "one",    "two",   "girl",  "boy"};
 //-------------------JSON----------------------
 // 定义PNG文件头的标识符
 const uint8_t png_signature[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
 char * request;         // 发送缓存
 char * response_buffer; // 接收缓存
 char * base64_decode;   // 解码指令缓存
+char bad_ = 0;          // 记录跳转
 
 lv_obj_t * clear_button;  // 清除按钮
 lv_obj_t * checkboxes[6]; // 声明一个静态数组来存储复选框对象句柄
@@ -52,13 +50,17 @@ lv_obj_t * dropdown;      // 下拉列表句柄
 lv_obj_t * d2;            // 二级下拉菜单
 lv_obj_t * select_button; // 生成方式句柄
 lv_obj_t * CorS_button;   // 线稿切换句柄
-char opinion;             // 记录复选框的设置
+lv_obj_t * bar;           // 进度条
+char opinion;             // 记录复选框的设置，实时
+char opinion_d2[12];      // 记录所有二级复选框的设置，发送用 randoms[0] cscenery[1-5] figure[6-11]
 char like;                // 记录下拉列表设置
 char like_d2;             // 记录二级下拉菜单的设置
 char t_or_i     = 1;      // 0:t 1:i
 char * send_str = NULL;   // 初始json项目为空字符串
 char send_end_1 = 0;      // 发送结束标志位
 char CorS       = 0;      // 0:canny硬边缘 1:scribble_pidinet涂鸦
+
+int pipefd[2]; // 接收线程和主线程的简单异步通讯
 
 // 定义t_or_i按钮的状态
 typedef enum { BUTTON_STATE_NORMAL, BUTTON_STATE_SELECTED } button_state_t;
@@ -82,6 +84,8 @@ button_state_t CorS_button_state   = BUTTON_STATE_NORMAL; // CorS
 #define BASE_NAME "canvas_snapshot.BASE"
 
 void lv_100ask_sketchpad_simple_test(void);
+void CorS_button_NORMAL(lv_obj_t * label_d2);
+void CorS_button_SELECTED(lv_obj_t * label_d2);
 void btn_handler(lv_event_t * e);
 void store_result_to_bit(char * byte, int position, int result);
 bool read_bit_char(char * byte, int bit_position);
@@ -93,6 +97,7 @@ lv_obj_t * create_send_button(lv_obj_t * sketchpad);
 void create_select_button(lv_obj_t * sketchpad);
 void create_CorS_button(lv_obj_t * sketchpad);
 void create_dropdown(lv_obj_t * clear_button);
+void create_progress(lv_obj_t * parent); // 进度条
 void convert_bin_to_bmp(const char * binFilename, const char * bmpFilename, uint32_t width, uint32_t height);
 
 int read_png_header(FILE * file);
@@ -105,7 +110,7 @@ void decodePng(const char * input, const char * output);
 void * send_request(void * sockfd);
 void * receive_response(void * sockfd);
 void read_bmp_pixels(const char * filename, size_t cbuf_size);
-void send_to_server(void);
+void * send_to_server(void);
 
 lv_obj_t * sketchpad; // 画布
 //-------------画板-------------
@@ -153,17 +158,14 @@ int main(void)
     rl.rlim_max = RLIM_INFINITY;
     setrlimit(RLIMIT_STACK, &rl);
 
-    /*lvgl初始化*/
-    lv_init();
+    // printf("\033[?25l"); // 隐藏光标闪烁
 
-    /*输出设备初始化及注册*/
-    fbdev_init();
-    /*A small buffer for LittlevGL to draw the screen's content*/
-    static lv_color_t buf[DISP_BUF_SIZE];
-    /*Initialize a descriptor for the buffer*/
-    static lv_disp_draw_buf_t disp_buf;
-    lv_disp_draw_buf_init(&disp_buf, buf, NULL, DISP_BUF_SIZE);
-    /*Initialize and register a display driver*/
+    lv_init();                                                  // lvgl初始化
+    fbdev_init();                                               // 输出设备初始化及注册
+    static lv_color_t buf[DISP_BUF_SIZE];                       // 显存大小
+    static lv_disp_draw_buf_t disp_buf;                         // 显存设置结构体
+    lv_disp_draw_buf_init(&disp_buf, buf, NULL, DISP_BUF_SIZE); // 将显存空间传递到结构体中
+    /*注册屏幕驱动与相关参数*/
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
     disp_drv.draw_buf = &disp_buf;
@@ -233,6 +235,27 @@ void lv_100ask_sketchpad_simple_test(void)
 
     create_send_button(sketchpad);   // 创建发送按钮
     create_checkboxes(lv_scr_act()); // 复选框
+    create_progress(lv_scr_act());   // 进度条
+}
+void CorS_button_NORMAL(lv_obj_t * label_d2)
+{
+    // if(CorS_button_state == BUTTON_STATE_NORMAL) {
+    if(t_or_i == 1) {
+        lv_label_set_text(label_d2, "CtrlNet OFF");
+    } else if(t_or_i == 0) {
+        lv_label_set_text(label_d2, "CtrlNet OFF");
+    }
+    // }
+}
+void CorS_button_SELECTED(lv_obj_t * label_d2)
+{
+    // if(CorS_button_state == BUTTON_STATE_SELECTED) {
+    if(t_or_i == 1) {
+        lv_label_set_text(label_d2, "Scribble");
+    } else if(t_or_i == 0) {
+        lv_label_set_text(label_d2, "Canny");
+    }
+    // }
 }
 void btn_handler(lv_event_t * e)
 {
@@ -253,6 +276,9 @@ void btn_handler(lv_event_t * e)
         lv_obj_clear_state(checkboxes[4], LV_STATE_CHECKED | LV_STATE_DISABLED);
         lv_obj_clear_state(checkboxes[5], LV_STATE_CHECKED | LV_STATE_DISABLED);
         opinion = 0; // 清除选择
+        for(int a = 0; a <= 11; a++) {
+            opinion_d2[a] = 0; // 清空所有永久配置
+        }
 
         DIR * dir;
         struct dirent * entry;
@@ -271,6 +297,8 @@ void btn_handler(lv_event_t * e)
             }
         }
         closedir(dir);
+        lv_bar_set_value(bar, 0, LV_ANIM_OFF); // 清空进度条
+        bad_ = 0;                              // 清空跳转
     }
     //----------------------------一级按钮----------------------------
     if(obj == select_button) {
@@ -282,22 +310,18 @@ void btn_handler(lv_event_t * e)
                 lv_label_set_text(label_d1, "txt 2 img");
                 t_or_i              = 0;
                 t_or_i_button_state = BUTTON_STATE_SELECTED;
-                goto change_1;
-                goto change_2; // 强制刷新
-                // lv_event_send(CorS_button, LV_EVENT_VALUE_CHANGED, NULL); // 提醒二级按钮改变标签
-                // lv_event_send_refresh_recursive(CorS_button); // 通知刷新该对象以及所有子对象
+                CorS_button_NORMAL(label_d2);
+                CorS_button_SELECTED(label_d2); // 强制刷新
             } else if(t_or_i_button_state == BUTTON_STATE_SELECTED) {
                 // 再按一下恢复为黄色
-                lv_obj_set_style_bg_color(select_button, lv_color_hex(0xffff00), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(select_button, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_label_set_text(label_d1, "img 2 img");
                 t_or_i              = 1;
                 t_or_i_button_state = BUTTON_STATE_NORMAL;
-                goto change_1;
-                goto change_2; // 强制刷新
-                // lv_event_send(CorS_button, LV_EVENT_VALUE_CHANGED, NULL); // 提醒二级按钮改变标签
-                // lv_event_send_refresh_recursive(CorS_button); // 通知刷新该对象以及所有子对象
+                CorS_button_NORMAL(label_d2);
+                CorS_button_SELECTED(label_d2); // 强制刷新
             }
-            printf("t_or_i_button_state: %d\nt_or_i:\t%d\n", t_or_i_button_state, t_or_i);
+            printf("Btn_1_state: %d\tt_or_i:%d\n", t_or_i_button_state, t_or_i); // 要在标志位刷新完后打印
         }
     }
     //----------------------------二级按钮----------------------------
@@ -308,25 +332,15 @@ void btn_handler(lv_event_t * e)
                 lv_obj_set_style_bg_color(CorS_button, lv_color_hex(0xff0000), LV_PART_MAIN | LV_STATE_DEFAULT);
                 CorS              = 0;
                 CorS_button_state = BUTTON_STATE_SELECTED;
-            change_1:
-                if(t_or_i == 1) {
-                    lv_label_set_text(label_d2, "Scribble");
-                } else if(t_or_i == 0) {
-                    lv_label_set_text(label_d2, "CtrlNet OFF");
-                }
+                CorS_button_NORMAL(label_d2);
             } else if(CorS_button_state == BUTTON_STATE_SELECTED) {
                 // 再按一下恢复为黄色
-                lv_obj_set_style_bg_color(CorS_button, lv_color_hex(0xffff00), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(CorS_button, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
                 CorS              = 1;
                 CorS_button_state = BUTTON_STATE_NORMAL;
-            change_2:
-                if(t_or_i == 1) {
-                    lv_label_set_text(label_d2, "Canny");
-                } else if(t_or_i == 0) {
-                    lv_label_set_text(label_d2, "CtrlNet ON");
-                }
+                CorS_button_SELECTED(label_d2);
             }
-            printf("CorS_button_state: %d\nCorS:\t%d\n", CorS_button_state, CorS);
+            printf("Btn_2_state: %d\tCorS:%d\n", CorS_button_state, CorS);
         }
     }
 }
@@ -336,15 +350,25 @@ void event_handler(lv_event_t * e)
     lv_obj_t * obj       = lv_event_get_target(e);                   // 对象
     like                 = (char)lv_dropdown_get_selected(dropdown); // 获取下拉菜单选项
     like_d2              = (char)lv_dropdown_get_selected(d2);       // 获取二级下拉菜单选项
+    char temp;                                                       // 存储需要写入所有选项的下标
+    if(like == 0) {
+        temp = 0; // 只有一个选项
+    } else if(like == 1) {
+        temp = like_d2 + 1; // 五个选项
+    } else if(like == 2) {
+        temp = like_d2 + 6; // 六个选项
+    }
 
     bool state_checkBox;
     //------------------------------复选框----------------------------
     if(code == LV_EVENT_VALUE_CHANGED) { // 切换状态时触发
+
         for(int a = 0; a <= 5; a++) {
             if(obj == checkboxes[a]) {
                 state_checkBox = lv_obj_has_state(checkboxes[a], LV_STATE_CHECKED);
-                store_result_to_bit(&opinion, a, (int)state_checkBox);
-                if(like == 2) {
+                store_result_to_bit(&opinion, a, (int)state_checkBox);          // 写入实时选项
+                store_result_to_bit(&opinion_d2[temp], a, (int)state_checkBox); // 保存所有选项
+                /*if(like == 2) {// 旧的业务逻辑 互斥逻辑可以参考
                     if(read_bit_char(&opinion, a) == 1) {
                         if(a % 2 == 0) { // 构建人物模式下按钮两两互斥逻辑
                             lv_obj_clear_state(checkboxes[a + 1], LV_STATE_CHECKED); // 清除选中状态
@@ -355,35 +379,62 @@ void event_handler(lv_event_t * e)
                         }
                     }
                 } else {
-                }
+                }*/
                 printf("CheckBox %d:\tPUSSED\tOpinion:\t", a);
-                print_binary_char_padding(&opinion); // 输出最终配置
+                print_binary_char_padding(&opinion); // 输出实时配置
+                printf("final opinion: \t");
+                for(int a = 0; a <= 11; a++) {
+                    printf("%d ", opinion_d2[a]); // 按数字打印所有配置
+                }
+                printf("\n");
             }
         }
         //--------------------复选框----------------下拉列表----------------
         if(obj == dropdown) {
             printf("Dropdown:\t%d\n", like);
-            opinion = 0;        // 重置提示词选择
-            int b   = like * 6; // 计算选项索引
+            opinion = 0; // 重置提示词选择
+            // int b   = like * 6; // 计算选项索引
             for(char a = 0; a <= 5; a++) {
                 lv_obj_clear_state(checkboxes[a], LV_STATE_DISABLED); // 清除不可用状态
                 lv_obj_clear_state(checkboxes[a], LV_STATE_CHECKED);  // 移除选中
-                lv_checkbox_set_text(checkboxes[a], show_txt[a + b]); // 更换词条
+                // 读取之前的选择
+                if(read_bit_char(&opinion_d2[temp], a)) {
+                    lv_obj_add_state(checkboxes[a], LV_STATE_CHECKED); // 添加选中
+                }
+                if(like == 0) {
+                    lv_checkbox_set_text(checkboxes[a], randoms[a]);
+                } else if(like == 1) {
+                    lv_checkbox_set_text(checkboxes[a], cscenery[a]);
+                } else if(like == 2) {
+                    lv_checkbox_set_text(checkboxes[a], figure[a]);
+                }
             }
             if(like == 0) {
                 lv_dropdown_set_options(d2, "None");
             } else if(like == 1) {
-                lv_dropdown_set_options(d2, "hill\nwater\ncity\nsky\nexample");
+                lv_dropdown_set_options(d2, "soil\nwater\ncity\nsky\nexample");
             } else if(like == 2) {
-                lv_dropdown_set_options(d2, "head\nbody\nlegs\nshoes\nfull\nposture");
+                lv_dropdown_set_options(d2, "hair\nbody\nlegs\nshoes\nposturen\nexample");
             }
         }
         //--------------------------二级下拉菜单----------------------------
-        // if(obj == d2) {
-        //     if(like == 0) {
-        //     }
-        // }
-        //----------------------------复选框--------------------------------
+        if(obj == d2) {
+            printf("Dropdown_d2:\t%d\n", like_d2);
+            opinion = 0; // 切换二级菜单时清空复选框内容
+            for(char a = 0; a <= 5; a++) {
+                lv_obj_clear_state(checkboxes[a], LV_STATE_DISABLED); // 清除不可用状态
+                lv_obj_clear_state(checkboxes[a], LV_STATE_CHECKED);  // 移除选中
+                // 读取之前的选择
+                if(read_bit_char(&opinion_d2[temp], a)) {
+                    lv_obj_add_state(checkboxes[a], LV_STATE_CHECKED); // 添加选中
+                }
+                if(like == 1) {
+                    lv_checkbox_set_text(checkboxes[a], cscenery[a + 6 * like_d2]);
+                } else if(like == 2) {
+                    lv_checkbox_set_text(checkboxes[a], figure[a + 6 * like_d2]);
+                }
+            }
+        }
     }
 }
 void store_result_to_bit(char * byte, int position, int result) // 将函数返回值存储到 char 变量的指定位上
@@ -445,7 +496,7 @@ void create_select_button(lv_obj_t * sketchpad)
     lv_obj_set_pos(select_button, 120, 0);
     lv_obj_set_align(select_button, LV_ALIGN_TOP_LEFT);
     // 设置按钮为蓝色
-    lv_obj_set_style_bg_color(select_button, lv_color_hex(0xffff00), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(select_button, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
     // 设置按钮大小
     lv_obj_set_size(select_button, 100, 40);
 
@@ -467,13 +518,13 @@ void create_CorS_button(lv_obj_t * sketchpad) // 切换图生线还是线生图
     lv_obj_set_pos(CorS_button, 240, 0);
     lv_obj_set_align(CorS_button, LV_ALIGN_TOP_LEFT);
     // 设置按钮为蓝色
-    lv_obj_set_style_bg_color(CorS_button, lv_color_hex(0xffff00), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(CorS_button, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
     // 设置按钮大小
     lv_obj_set_size(CorS_button, 100, 40);
 
     // 创建按钮文本
     lv_obj_t * label = lv_label_create(CorS_button);
-    lv_label_set_text(label, "Canny");
+    lv_label_set_text(label, "Scribble");
     lv_obj_set_align(label, LV_ALIGN_CENTER);
     lv_obj_set_style_text_color(label, lv_color_white(), 0); // 设置文本颜色为白色
 
@@ -481,7 +532,6 @@ void create_CorS_button(lv_obj_t * sketchpad) // 切换图生线还是线生图
     // lv_obj_add_event_cb(CorS_button, CorS_button_callback, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(CorS_button, btn_handler, LV_EVENT_PRESSED, NULL);
 }
-
 void create_dropdown(lv_obj_t * parent) // 选择风格
 {
     dropdown = lv_dropdown_create(parent);            // 创建下拉菜单
@@ -501,8 +551,24 @@ void create_d2(lv_obj_t * parent) // 风格二级菜单
     lv_dropdown_set_selected(d2, 0);                            // 设置下拉菜单的初始值
     lv_obj_add_event_cb(d2, event_handler, LV_EVENT_ALL, NULL); // 添加回调函数
 }
+void create_progress(lv_obj_t * parent) // 进度条
+{
+    bar = lv_bar_create(parent);
+    lv_obj_set_size(bar, 200, 20);                   // 设置进度条大小
+    lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, -120, 10); // 对齐位置
+    lv_obj_set_style_anim_time(bar, 3000, LV_STATE_DEFAULT); // 设置动画时间，默认动画是很快的 需要在设置值之前
+    lv_bar_set_range(bar, 0, 100);                           // 设置进度条范围
+    lv_bar_set_value(bar, 0, LV_ANIM_ON); // 其实默认就是0，如果想更改初始默认值，需要修改模式
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x50FF50), LV_PART_INDICATOR);
+    // printf("create_progress\n");
+}
 void send_button_callback(lv_event_t * e)
 {
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    lv_bar_set_value(bar, 90, LV_ANIM_ON);
+    // lv_obj_invalidate(bar); // 标记无效对象
+    // lv_task_handler();      // 调用任务句柄
+
     lv_obj_t * btn   = lv_event_get_target(e);   // 获取对象
     lv_obj_t * label = lv_obj_get_child(btn, 0); // 通过子对象的索引获取子对象
     // lv_event_code_t code = lv_event_get_code(e);      // 获取事件的事件代码
@@ -520,7 +586,16 @@ void send_button_callback(lv_event_t * e)
     // bmp转base64
     base64_encode_file(BMP_NAME, BASE_NAME);
     // 发送到服务器 这里会产生阻塞等待 如果不想等待需要再开一个线程
-    send_to_server();
+
+    // 创建分离属性的子线程
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    pthread_create(&thread, &attr, send_to_server, NULL);
+    pthread_attr_destroy(&attr);
+
+    // send_to_server();
 
     // 执行完毕后恢复文本
     // lv_label_set_text(label, "SEND");
@@ -550,14 +625,14 @@ void create_checkboxes(lv_obj_t * parent)
 {
     lv_coord_t y1 = 65;  // 垂直起始值
     lv_coord_t y  = 30;  // 垂直偏移值
-    lv_coord_t x1 = -30; // 水平位置
+    lv_coord_t x1 = -10; // 水平位置
     lv_coord_t f  = 10;  // 复选框间隔
-    lv_coord_t w  = 80;  // 限制复选框宽度
+    lv_coord_t w  = 120; // 限制复选框宽度
 
     for(int a = 0; a <= 5; a++) {
         checkboxes[a] = lv_checkbox_create(parent);
         lv_obj_set_width(checkboxes[a], w);
-        lv_checkbox_set_text(checkboxes[a], show_txt[a]);
+        lv_checkbox_set_text(checkboxes[a], randoms[a]);
         lv_obj_set_style_pad_column(checkboxes[a], f, LV_STATE_DEFAULT);
         lv_obj_align(checkboxes[a], LV_ALIGN_TOP_RIGHT, x1, (y1 + y * a)); // 设置位置
         lv_obj_add_event_cb(checkboxes[a], event_handler, LV_EVENT_ALL, NULL);
@@ -729,7 +804,7 @@ void appendStringWithComma(char ** str_ptr, const char * content) // 合成键�
     }
     // 将内容追加到字符串末尾
     strcat(*str_ptr, content);
-    printf("本次追加内容%s\n", *str_ptr);
+    // printf("本次追加内容%s\n", *str_ptr);
 }
 void * send_request(void * sockfd) // 发送线程
 {
@@ -758,43 +833,8 @@ void * send_request(void * sockfd) // 发送线程
     json = cJSON_CreateObject();
     appendStringWithComma(&send_str, "masterpiece,best quality"); // 添加前置提示词
     // 提示词添加逻辑
-    if(like == 1) {
-        if(read_bit_char(&opinion, 0)) {
-            appendStringWithComma(&send_str, "water");
-        }
-        if(read_bit_char(&opinion, 1)) {
-            appendStringWithComma(&send_str, "beach");
-        }
-        if(read_bit_char(&opinion, 2)) {
-            appendStringWithComma(&send_str, "street");
-        }
-        if(read_bit_char(&opinion, 3)) {
-            appendStringWithComma(&send_str, "day");
-        }
-        if(read_bit_char(&opinion, 4)) {
-            appendStringWithComma(&send_str, "night");
-        }
-        if(read_bit_char(&opinion, 5)) {
-            appendStringWithComma(&send_str, "flower");
-        }
-    } else if(like == 2) {
-        if(read_bit_char(&opinion, 3) && read_bit_char(&opinion, 4)) {
-            appendStringWithComma(&send_str, "2girls");
-        } else if(read_bit_char(&opinion, 2) && read_bit_char(&opinion, 4)) {
-            appendStringWithComma(&send_str, "1girl");
-        } else if(read_bit_char(&opinion, 3) && read_bit_char(&opinion, 5)) {
-            appendStringWithComma(&send_str, "2boys");
-        } else if(read_bit_char(&opinion, 2) && read_bit_char(&opinion, 5)) {
-            appendStringWithComma(&send_str, "1boy");
-        }
-        //--------------------以上两两互斥-----------------
-        if(read_bit_char(&opinion, 1) && read_bit_char(&opinion, 4)) {
-            appendStringWithComma(&send_str, "open clothes, breasts, pussy juice"); // 瑟瑟打开 且为女
-        } else if(read_bit_char(&opinion, 0) && read_bit_char(&opinion, 4)) {
-            appendStringWithComma(&send_str,
-                                  "yellow hair,green eyes, white dress, day, beach, smile"); // 瑟瑟关闭 且为女
-        }
-    }
+    prompt(); // 新的添加逻辑已经移到tip.c
+
     if(opinion == 0) {
         cJSON_AddItemToObject(json, "prompt", cJSON_CreateString("")); // 如果所有选项都没有勾选，则填充空
     } else {                                                           // 否则填入处理过的字段
@@ -802,71 +842,95 @@ void * send_request(void * sockfd) // 发送线程
     }
     cJSON_AddItemToObject(json, "negative_prompt",
                           cJSON_CreateString(nenegative_prompt)); // 固定的反向提示词
-    //-----------------------------提示词逻辑----------------------
-    printf("提示词为: %s", cJSON_PrintUnformatted(json));
 
-    cJSON_AddItemToObject(json, "seed", cJSON_CreateNumber(-1));
-    cJSON_AddItemToObject(json, "batch_size", cJSON_CreateNumber(1));
-    cJSON_AddItemToObject(json, "n_iter", cJSON_CreateNumber(1));
-    cJSON_AddItemToObject(json, "steps", cJSON_CreateNumber(20));
-    cJSON_AddItemToObject(json, "cfg_scale", cJSON_CreateNumber(7));
-    cJSON_AddItemToObject(json, "width", cJSON_CreateNumber(SKETCHPAD_DEFAULT_WIDTH));
-    cJSON_AddItemToObject(json, "height", cJSON_CreateNumber(SKETCHPAD_DEFAULT_HEIGHT));
-    cJSON_AddItemToObject(json, "restore_faces", cJSON_CreateTrue()); // 符合面部特征
-    cJSON_AddItemToObject(json, "tiling", cJSON_CreateFalse());       // 是否使用平铺/重复生成图像
+    printf("正向:\n%s\n反向:\n%s", send_str, nenegative_prompt);
+    // printf("提示词为: %s", cJSON_PrintUnformatted(json));
+    //-----------------------------提示词逻辑----------------------
+    cJSON_AddItemToObject(json, "seed", cJSON_CreateNumber(-1));                         // 种子
+    cJSON_AddItemToObject(json, "batch_size", cJSON_CreateNumber(1));                    // 并行队列
+    cJSON_AddItemToObject(json, "n_iter", cJSON_CreateNumber(1));                        // 批量队列
+    cJSON_AddItemToObject(json, "steps", cJSON_CreateNumber(20));                        // 迭代步数
+    cJSON_AddItemToObject(json, "cfg_scale", cJSON_CreateNumber(7));                     // 提示词相关性
+    cJSON_AddItemToObject(json, "width", cJSON_CreateNumber(SKETCHPAD_DEFAULT_WIDTH));   // 宽
+    cJSON_AddItemToObject(json, "height", cJSON_CreateNumber(SKETCHPAD_DEFAULT_HEIGHT)); // 高
+    cJSON_AddItemToObject(json, "restore_faces", cJSON_CreateTrue());                    // 面部修复
+    cJSON_AddItemToObject(json, "tiling", cJSON_CreateFalse()); // 是否使用平铺/重复生成图像
     cJSON_AddItemToObject(json, "eta", cJSON_CreateNumber(0));
     cJSON_AddItemToObject(json, "script_args", cJSON_CreateArray()); // 传递给生成图像的脚本的参数
     cJSON_AddItemToObject(json, "sampler_index", cJSON_CreateString("DPM++ SDE Karras")); // 图像采样器的索引
-
-    if(t_or_i == 1) { // 图生图的基础图像是在外面的
-        cJSON * initImagesArray = cJSON_AddArrayToObject(json, "init_images"); // 图生图的基础图片
-        cJSON_AddItemToArray(initImagesArray, cJSON_CreateString(buffer));
-    }
+    //-----------------------------公用部分--------------------------
     if(t_or_i == 1) { // 图生图
+        if(CorS == 1) {
+            t_or_i = 0;
+            bad_   = 1;
+            goto bad;
+        }
         cJSON * override_settings = cJSON_AddObjectToObject(json, "override_settings");
         cJSON_AddItemToObject(
             override_settings, "sd_model_checkpoint",
             cJSON_CreateString(
                 "cetusMix_Whalefall2.safetensors [876b4c7ba5]")); // anything-v5-PrtRE.safetensors [7f96a1a9ca]
         cJSON_AddItemToObject(override_settings, "sd_vae", cJSON_CreateString("Automatic"));
-    } else if(t_or_i == 0) { // 文生图+控制网
-        cJSON_AddItemToObject(json, "override_settings", cJSON_CreateObject());
-        cJSON_AddStringToObject(cJSON_GetObjectItem(json, "override_settings"), "sd_model_checkpoint",
-                                "animevae.pt"); // 一般用于修改本次的生成图片的stable diffusion
-                                                // 模型，用法需保持一致 Chilloutmix-Ni
-        // 添加 "alwayson_scripts" 对象
-        cJSON * alwaysonScriptsObject = cJSON_AddObjectToObject(json, "alwayson_scripts");            // 脚本参数
-        cJSON * controlNetObject      = cJSON_AddObjectToObject(alwaysonScriptsObject, "ControlNet"); // 控制网参数
-        cJSON * argsArray             = cJSON_AddArrayToObject(controlNetObject, "args");
-        cJSON * argsObject            = cJSON_CreateObject();
-        cJSON_AddItemToArray(argsArray, argsObject);
-
-        // 向 "args" 对象中添加键值对
-        cJSON_AddItemToObject(argsObject, "enabled", cJSON_CreateTrue());         // 是否启用
-        cJSON_AddItemToObject(argsObject, "control_mode", cJSON_CreateNumber(0)); // 对应ControlMode使用012
-        cJSON_AddItemToObject(argsObject, "model",
-                              cJSON_CreateString("control_v11p_sd15s2_lineart_anime_fp16 [c58f338b]")); // 控制网名字
-        // if(CorS == 0) {
-        //     cJSON_AddItemToObject(argsObject, "module",
-        //                           cJSON_CreateString("canny")); // 生成线稿
-        // } else if(CorS == 1) {
-        //     cJSON_AddItemToObject(argsObject, "module",
-        //                           cJSON_CreateString("invert (from white bg & black line)")); // 线稿生图
-        // }
-        cJSON_AddItemToObject(argsObject, "weight", cJSON_CreateNumber(1));                      // 权重
-        cJSON_AddItemToObject(argsObject, "resize_mode", cJSON_CreateString("Crop and Resize")); // 裁剪模式
-        cJSON_AddItemToObject(argsObject, "mask", cJSON_CreateNull());                           // 蒙版
-        cJSON_AddItemToObject(argsObject, "invert_image", cJSON_CreateFalse());                  // 是否翻转
-
-        cJSON_AddItemToObject(argsObject, "rgbbgr_mode", cJSON_CreateFalse());       // 色彩通道
-        cJSON_AddItemToObject(argsObject, "lowvram", cJSON_CreateFalse());           // 是否为低显存
-        cJSON_AddItemToObject(argsObject, "processor_res", cJSON_CreateNumber(512)); // 处理器分辨率
-        cJSON_AddItemToObject(argsObject, "threshold_a", cJSON_CreateNumber(64)); // 阈值a 部分control module会用上
-        cJSON_AddItemToObject(argsObject, "threshold_b", cJSON_CreateNumber(64));    // 阈值b
-        cJSON_AddItemToObject(argsObject, "guidance_start", cJSON_CreateNumber(0));  // 什么时候介入
-        cJSON_AddItemToObject(argsObject, "guidance_end", cJSON_CreateNumber(1));    // 什么时候退出
-        cJSON * initImagesArray = cJSON_AddArrayToObject(argsObject, "input_image"); // 向控制网输入图片
+        // 图生图控制网关基础图像是在外面的
+        cJSON * initImagesArray = cJSON_AddArrayToObject(json, "init_images"); // 图生图的基础图片
         cJSON_AddItemToArray(initImagesArray, cJSON_CreateString(buffer));
+    }
+    if(t_or_i == 0) { // 单文生图 ：忽略画板内容，仅输入提示词
+        cJSON * override_settings = cJSON_AddObjectToObject(json, "override_settings");
+        cJSON_AddItemToObject(
+            override_settings, "sd_model_checkpoint",
+            cJSON_CreateString(
+                "cetusMix_Whalefall2.safetensors [876b4c7ba5]")); // anything-v5-PrtRE.safetensors [7f96a1a9ca]
+        cJSON_AddItemToObject(override_settings, "sd_vae", cJSON_CreateString("Automatic"));
+        // 以下为启动控制网所独有
+        if(CorS == 1) { // 文生图 + 控制网 ：画板内容作为轮廓
+        bad:
+            // 添加 "alwayson_scripts" 对象
+            cJSON * alwaysonScriptsObject = cJSON_AddObjectToObject(json, "alwayson_scripts");       // 脚本参数
+            cJSON * controlNetObject = cJSON_AddObjectToObject(alwaysonScriptsObject, "ControlNet"); // 控制网参数
+            cJSON * argsArray        = cJSON_AddArrayToObject(controlNetObject, "args");
+            cJSON * argsObject       = cJSON_CreateObject();
+            cJSON_AddItemToArray(argsArray, argsObject);
+
+            // 向 "args" 对象中添加键值对
+            cJSON_AddItemToObject(argsObject, "enabled", cJSON_CreateTrue());         // 是否启用
+            cJSON_AddItemToObject(argsObject, "control_mode", cJSON_CreateNumber(0)); // 对应ControlMode使用012
+            if(bad_ == 0) {
+                cJSON_AddItemToObject(argsObject, "model",
+                                      cJSON_CreateString("control_v11p_sd15_canny_fp16 [b18e0966]")); // 控制网名字
+                cJSON_AddItemToObject(argsObject, "module",
+                                      cJSON_CreateString("canny")); // 预处理器名字
+            } else {
+                cJSON_AddItemToObject(argsObject, "model",
+                                      cJSON_CreateString("control_v11p_sd15_scribble_fp16 [4e6af23e]")); // 控制网名字
+                cJSON_AddItemToObject(argsObject, "module",
+                                      cJSON_CreateString("t2ia_sketch_pidi")); // 预处理器名字
+                bad_ = 0;                                                      // 结束跳转
+            }
+            // if(CorS == 0) {
+            //     cJSON_AddItemToObject(argsObject, "module",
+            //                           cJSON_CreateString("canny")); // 生成线稿
+            // } else if(CorS == 1) {
+            //     cJSON_AddItemToObject(argsObject, "module",
+            //                           cJSON_CreateString("invert (from white bg & black line)")); // 线稿生图
+            // }
+            cJSON_AddItemToObject(argsObject, "weight", cJSON_CreateNumber(1));                      // 权重
+            cJSON_AddItemToObject(argsObject, "resize_mode", cJSON_CreateString("Crop and Resize")); // 裁剪模式
+            // cJSON_AddItemToObject(argsObject, "mask", cJSON_CreateNull());                           // 蒙版
+            cJSON_AddItemToObject(argsObject, "invert_image", cJSON_CreateFalse()); // 是否翻转
+
+            cJSON_AddItemToObject(argsObject, "rgbbgr_mode", cJSON_CreateFalse());       // 色彩通道
+            cJSON_AddItemToObject(argsObject, "lowvram", cJSON_CreateFalse());           // 是否为低显存
+            cJSON_AddItemToObject(argsObject, "processor_res", cJSON_CreateNumber(512)); // 处理器分辨率
+            cJSON_AddItemToObject(argsObject, "threshold_a", cJSON_CreateNumber(100));   // 阈值a
+            cJSON_AddItemToObject(argsObject, "threshold_b", cJSON_CreateNumber(200));   // 阈值b
+            cJSON_AddItemToObject(argsObject, "guidance_start", cJSON_CreateNumber(0));  // 什么时候介入
+            cJSON_AddItemToObject(argsObject, "guidance_end", cJSON_CreateNumber(1));    // 什么时候退出
+            cJSON_AddItemToObject(argsObject, "pixel_perfect", cJSON_CreateTrue());      // 完美像素
+            // cJSON * initImagesArray = cJSON_AddArrayToObject(argsObject, "input_image"); // 向控制网输入图片
+            // cJSON_AddItemToArray(initImagesArray, cJSON_CreateString(buffer));  这样会增加中括号 弃用
+            cJSON_AddItemToObject(argsObject, "input_image", cJSON_CreateString(buffer)); // 向控制网输入图片
+        }
     }
 
     char * data = cJSON_PrintUnformatted(json);
@@ -922,7 +986,7 @@ void * send_request(void * sockfd) // 发送线程
     //  重新分配内存
     //  send_str = (char *)realloc(send_str, 0);
 
-    printf("send_request:\tClose\n\n");
+    printf("send_request:\tClose\n");
     pthread_exit(NULL);
 }
 void * receive_response(void * sockfd) // 接收线程
@@ -932,10 +996,8 @@ void * receive_response(void * sockfd) // 接收线程
     if(response_buffer == NULL) {
         printf("内存分配失败\n");
     }
-
     // 接收服务器返回的数据
     memset(response_buffer, 0, MAX_BUFFER_SIZE);
-
     int total_bytes_received = 0;
     int bytes_received;
     while((bytes_received = recv(sockfd_value, response_buffer + total_bytes_received,
@@ -943,7 +1005,6 @@ void * receive_response(void * sockfd) // 接收线程
         total_bytes_received += bytes_received;
     }
     // printf("%s\n", response_buffer);
-
     // 提取"images"
     char * key       = "\"images\"";
     char * value     = NULL;
@@ -962,24 +1023,23 @@ void * receive_response(void * sockfd) // 接收线程
             }
         }
     }
-
     // 将BASE64数据保存到文件
     FILE * tempFile = fopen(SERVER_BASE_FILE_NAME, "w");
     if(tempFile != NULL) {
         fputs(value, tempFile);
         fclose(tempFile);
-
         // 解码BASE64数据
         decodeBase64(SERVER_BASE_FILE_NAME, SERVER_PNG_FILE_NAME);
-
         // 删除临时文件
         remove(SERVER_BASE_FILE_NAME);
     } else {
         printf("Error opening temporary file.\n");
     }
-
     // close(sockfd);
-    // printf("receive_response:\tClose\n");
+    printf("pipe write\n");
+    int data = 123;
+    write(pipefd[1], &data, sizeof(int)); // 只是说一声结束了
+    printf("receive_response:\tClose\n");
     pthread_exit(NULL);
 }
 void read_bmp_pixels(const char * filename, size_t cbuf_size) // 读取bmp到画布
@@ -1011,8 +1071,17 @@ void read_bmp_pixels(const char * filename, size_t cbuf_size) // 读取bmp到画
 
     fclose(bmpFile);
 }
-void send_to_server(void)
+void * send_to_server(void)
 {
+    // 创建管道
+    if(pipe(pipefd) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+    // 设置管道读取端为非阻塞
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+
     // 创建套接字
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sockfd < 0) {
@@ -1047,16 +1116,27 @@ void send_to_server(void)
         printf("Could not create receive thread\n");
         exit(EXIT_FAILURE);
     }
+    // create_progress(lv_scr_act());   // 进度条
+    //  等待两个线程执行完毕
+    // if(pthread_join(send_thread, NULL) < 0) {
+    //     printf("Send thread join failed\n");
+    //     exit(EXIT_FAILURE);
+    // }
+    // if(pthread_join(receive_thread, NULL) < 0) {
+    //     printf("Receive thread join failed\n");
+    //     exit(EXIT_FAILURE);
+    // }
+    pthread_join(send_thread, NULL); // 阻塞等待发送端结束
+    // create_progress(lv_scr_act());   // 进度条
+    // 主线程从管道读取数据
+    int received_data;
+    while(read(pipefd[0], &received_data, sizeof(int)) <= 0)
+        ;
+    printf("rec_EXIT\n");
+    // lv_bar_set_value(bar, 100, LV_ANIM_ON);
 
-    // 等待两个线程执行完毕
-    if(pthread_join(send_thread, NULL) < 0) {
-        printf("Send thread join failed\n");
-        exit(EXIT_FAILURE);
-    }
-    if(pthread_join(receive_thread, NULL) < 0) {
-        printf("Receive thread join failed\n");
-        exit(EXIT_FAILURE);
-    }
+    // 等待子线程结束
+    pthread_join(receive_thread, NULL);
 
     png_check();
     decodePng(SERVER_PNG_FILE_NAME, SERVER_BMP_FILE_NAME); // png转bmp
@@ -1070,4 +1150,11 @@ void send_to_server(void)
     free(request);
     free(response_buffer);
     close(sockfd);
+
+    close(pipefd[0]);                                       // 关闭管道的读端
+    close(pipefd[1]);                                       // 关闭管道的写端
+    lv_obj_set_style_anim_time(bar, 500, LV_STATE_DEFAULT); // 最后一段动快点
+    lv_bar_set_value(bar, 100, LV_ANIM_ON);
+    lv_obj_set_style_anim_time(bar, 3000, LV_STATE_DEFAULT);
+    // lv_bar_set_value(bar, 0, LV_ANIM_OFF);
 }
